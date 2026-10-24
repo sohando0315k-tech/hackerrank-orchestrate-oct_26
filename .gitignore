@@ -1,0 +1,60 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Bytecode, compilation and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and environment configurations
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*secret*
+*credential*
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS-specific files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Submission exclusions: Raw competition datasets and evidence
+# Final submission zip and repository must exclude dataset corpus
+dataset/
+evidence/
+*.sql
+*.log
+
+# Prohibited archives from submissions
+*.zip
+*.tar
+*.gz
+*.tgz
+*.7z
+*.rar
+
+# Ensure required submission output file is never ignored
+!output.csv
