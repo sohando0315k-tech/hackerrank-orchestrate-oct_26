@@ -66,3 +66,19 @@ def test_validate_inputs_sample_success():
         is_valid, errors = cfg.validate_inputs(use_sample=True)
         assert is_valid
         assert len(errors) == 0
+
+
+def test_gemini_api_key_configuration(monkeypatch):
+    """Verify GEMINI_API_KEY resolution and that OpenAI/Anthropic keys are not required."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test_gemini_key_123")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    cfg = AppConfig()
+    assert cfg.gemini_api_key == "test_gemini_key_123"
+
+    # Verify input validation succeeds without any OpenAI or Anthropic keys
+    if cfg.dataset_dir.is_dir() and (cfg.dataset_dir / "sample_deletion_requests.csv").is_file():
+        is_valid, errors = cfg.validate_inputs(use_sample=True)
+        assert is_valid
+        assert len(errors) == 0

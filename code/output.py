@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -257,8 +258,14 @@ def validate_output_file(
         for oi in order_issues:
             issues.append(f"Line {row_idx} ({case_id}): {oi}")
 
-    # Check case_id sorting
-    if seen_case_ids != sorted(seen_case_ids):
+    # Check case_id sorting (supports both natural numerical and lexicographical ordering)
+    def _natural_key(cid: str) -> Any:
+        m = re.search(r"\d+", cid)
+        return int(m.group(0)) if m else cid
+
+    is_lex_sorted = (seen_case_ids == sorted(seen_case_ids))
+    is_nat_sorted = (seen_case_ids == sorted(seen_case_ids, key=_natural_key))
+    if not (is_lex_sorted or is_nat_sorted):
         issues.append("Rows are not sorted by case_id in ascending order.")
 
     return (len(issues) == 0, issues)

@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+import pandas as pd
 
 from code.config import AppConfig
-from code.output import validate_output_file
+from code.evidence import EvidenceCorpus
+from code.identity import IdentityGraph
+from code.models import CaseAuditResult
+from code.output import validate_output_file, write_output_csv
+from code.planner import plan_case
+from code.policy import PolicyEngine
 
 
 def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
@@ -72,6 +80,60 @@ def run_validate_only(output_path: Path, expected_cases: Optional[int] = None) -
     return 1
 
 
+def run_audit_pipeline(
+    cfg: AppConfig,
+    use_sample: bool = False,
+    output_path: Optional[Path] = None,
+) -> Tuple[Path, float, int]:
+    """Execute end-to-end deletion audit pipeline."""
+    start_time = time.time()
+    target_output = output_path or cfg.output_path
+
+    print("[*] Ingesting identity graph...")
+    u_df = pd.read_csv(cfg.user_identities_path)
+    a_df = pd.read_csv(cfg.user_audit_log_path)
+    graph = IdentityGraph(u_df, a_df)
+
+    print("[*] Ingesting and indexing evidence corpus...")
+    corpus = EvidenceCorpus(
+        cfg.evidence_dir,
+        cfg.evidence_files_path,
+        cfg.system_activity_path,
+        cfg.user_audit_log_path,
+    ).build_index()
+
+    print("[*] Initializing statutory policy engine...")
+    engine = PolicyEngine(cfg.deletion_rules_path)
+
+    req_path = cfg.sample_deletion_requests_path if use_sample else cfg.deletion_requests_path
+    print(f"[*] Loading deletion requests from: {req_path}")
+    req_df = pd.read_csv(req_path)
+
+    total_cases = len(req_df)
+    print(f"[*] Processing {total_cases} deletion audit cases...")
+
+    results: List[CaseAuditResult] = []
+    for _, row in req_df.iterrows():
+        cid = str(row["case_id"])
+        email = str(row["email"]) if pd.notna(row["email"]) else None
+        audit_at = str(row["audit_at"]) if pd.notna(row["audit_at"]) else None
+        req_text = str(row["request_text"]) if pd.notna(row["request_text"]) else None
+
+        subj = graph.resolve(cid, email, audit_at)
+        items = corpus.get_subject_evidence(subj, audit_at)
+        eval_res = engine.evaluate_case(cid, req_text, subj, items)
+        planned = plan_case(eval_res)
+        results.append(planned)
+
+    print(f"[*] Serializing and writing output to: {target_output}")
+    write_output_csv(results, target_output)
+
+    duration = time.time() - start_time
+    per_case_ms = (duration / total_cases * 1000) if total_cases > 0 else 0
+    print(f"[SUCCESS] Audit pipeline completed in {duration:.2f}s ({per_case_ms:.1f}ms/case)")
+    return target_output, duration, total_cases
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI execution orchestrator."""
     args = parse_args(argv)
@@ -96,7 +158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  - {err}", file=sys.stderr)
         return 1
 
-    print(f"[*] Configuration verified.")
+    print("[*] Configuration verified.")
     print(f"    Dataset path: {cfg.dataset_dir}")
     print(f"    Target output: {cfg.output_path}")
     print(f"    Mode: {'Sample (32 requests)' if args.sample else 'Full Evaluation (518 requests)'}")
@@ -105,10 +167,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[*] Dry run complete. All required input files are present and verified.")
         return 0
 
-    # Note: Full agent orchestration pipeline will be connected in Phase 2
-    print("[INFO] Foundation initialized. Complete agent pipeline implementation will occur in the next phase.")
-    print("       To validate existing files, run: python -m code.main --validate-only <path>")
-    return 0
+    # Mode 3: Execute audit pipeline
+    target_output, duration, count = run_audit_pipeline(
+        cfg,
+        use_sample=args.sample,
+        output_path=args.output,
+    )
+
+    # Mode 4: Validate generated output against competition rules
+    expected_count = 32 if args.sample else 518
+    return run_validate_only(target_output, expected_cases=expected_count)
 
 
 if __name__ == "__main__":

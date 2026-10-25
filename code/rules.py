@@ -16,10 +16,9 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
-from code.models import DeletionStatus
 
 
 class RequestIntent(str, Enum):
@@ -52,6 +51,26 @@ RETENTION_PATTERNS = [
     r"\b(?:do\s+not|don['’]?t)\s+(?:delete|remove|erase|purge)\s+(?:my\s+)?((?:(?:billing|tax|financial)\s+)?(?:invoices?|records?|data|documents?|receipts?)|order\s+history|transactions?)\b",
     r"\b(?:retain|keep|preserve|hold|save)\s+(?:my\s+)?((?:(?:billing|tax|financial)\s+)?(?:invoices?|records?|data|documents?|receipts?)|order\s+history|transactions?)\b",
     r"\b(?:except|with\s+the\s+exception\s+of)\s+(?:for\s+)?(?:my\s+)?((?:(?:billing|tax|financial)\s+)?(?:invoices?|records?|data|documents?|receipts?)|order\s+history|transactions?)\b",
+]
+
+# Patterns requesting audit, verification, or confirmation of past deletion or residual traces
+AUDIT_VERIFICATION_PATTERNS = [
+    # English: audit, verify, confirm, inspect, check, investigate whether deleted/gone
+    r"\b(?:verify|confirm|check|audit|inspect|investigate)\b.*?\b(?:delet(?:ed|ion)|remov(?:ed|al)|eras(?:ed|ure)|gone|closed|truly\s+gone|left\s+behind|remains?)\b",
+    r"\bconfirm\s+that\s+(?:the\s+)?profile\s+is\s+gone\b",
+    r"\b(?:finish|complete)\s+(?:the\s+)?deletion\b",
+    r"\baudit\s+the\s+deletion\b",
+    r"\bcheck\s+(?:the\s+latest\s+state|that\s+nothing.*?was\s+left\s+behind)\b",
+    r"\b(?:handle|remove|delete|clean\s+up|clear|purge)\s+(?:them|the\s+remaining\s+(?:items|records|traces)|traces)\b",
+    r"\bdisable\s+(?:any\s+)?(?:synchronization|sync|connectors?|data\s+flows?)\b",
+    r"\b(?:can\s+you\s+verify|could\s+you\s+verify)\s+that\s+my\s+account\s+was\s+deleted\b",
+    r"\b(?:tell\s+me|check)\s+whether\s+the\s+account.*?are\s+(?:truly\s+)?gone\b",
+    # Multilingual audit / verification requests
+    r"\b(?:verificar|confirmar|auditar|comprobar|inspeccionar|investigar)\b.*?\b(?:eliminad[oa]|borrad[oa]|supresi[oó]n|cerrad[oa])\b",
+    r"\b(?:v[eé]rifier|confirmer|auditer|contr[oô]ler)\b.*?\b(?:supprim[eé]|effac[eé]|ferm[eé]|suppression)\b",
+    r"\b(?:[uü]berpr[uü]fen|best[aä]tigen|pr[uü]fen|auditieren)\b.*?\b(?:gel[oö]scht|loeschung|geschlossen)\b",
+    r"\b(?:verificar|confirmar|auditar|checar)\b.*?\b(?:exclu[ií]d[oa]|exclus[aã]o|apagad[oa]|fechad[oa])\b",
+    r"\b(?:verificare|confermare|controllare)\b.*?\b(?:cancellat[oa]|eliminat[oa]|cancellazione)\b",
 ]
 
 # Explicit general refusals or negations of account/data deletion
@@ -251,6 +270,12 @@ class DeletionIntentClassifier:
                 if not (in_refusal or in_historical or in_retention):
                     del_signals.append(m.group(0))
 
+        # 4b. Detect Deletion Audit / Verification Signals
+        audit_signals: List[str] = []
+        for pat in AUDIT_VERIFICATION_PATTERNS:
+            for m in re.finditer(pat, clean_text, re.IGNORECASE):
+                audit_signals.append(m.group(0))
+
         # 5. Detect Non-Deletion Specific Categories
         access_matches = [m.group(0) for pat in ACCESS_PATTERNS if (m := re.search(pat, clean_text, re.I))]
         rect_matches = [m.group(0) for pat in RECTIFICATION_PATTERNS if (m := re.search(pat, clean_text, re.I))]
@@ -287,6 +312,21 @@ class DeletionIntentClassifier:
                 detected_language=lang,
                 reasons=reasons,
                 matched_signals=del_signals,
+                retention_exceptions=retention_exceptions,
+            )
+
+        # Case B2: Deletion verification / audit requested
+        if audit_signals:
+            reasons = [f"Deletion verification / audit requested via signal '{audit_signals[0]}'"]
+            if retention_exceptions:
+                reasons.append(f"Retention exceptions preserved: {retention_exceptions}")
+            return IntentResult(
+                intent=RequestIntent.DELETION,
+                is_deletion_authorized=True,
+                confidence=1.0,
+                detected_language=lang,
+                reasons=reasons,
+                matched_signals=audit_signals + del_signals,
                 retention_exceptions=retention_exceptions,
             )
 

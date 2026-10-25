@@ -18,13 +18,13 @@ from __future__ import annotations
 import base64
 import csv
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import zlib
 
 import pandas as pd
@@ -41,6 +41,38 @@ try:
     from PIL import Image
 except ImportError:  # pragma: no cover
     Image = None
+
+_CANONICAL_USER_ID_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
+
+
+def _canonical_user_id(uid: Optional[str]) -> Optional[str]:
+    """Normalize canonical user_id string (strictly matching user_ followed by digits) or return None if absent."""
+    if not uid or not isinstance(uid, str):
+        return None
+    cleaned = uid.strip().lower()
+    return cleaned if _CANONICAL_USER_ID_REGEX.match(cleaned) else None
+
+
+canonical_user_id = _canonical_user_id
+
+
+@dataclass
+class ParserError:
+    """Structured record of an evidence parsing or ingestion failure."""
+    file_id: str
+    file_path: str
+    parser: str
+    error_type: str
+    error_message: str
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "file_id": self.file_id,
+            "file_path": self.file_path,
+            "parser": self.parser,
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+        }
 
 
 @dataclass
@@ -148,10 +180,21 @@ def parse_sql_dump(
     file_id: str,
     captured_at: Optional[str],
     origin: str,
+    error_sink: Optional[List[ParserError]] = None,
 ) -> List[NormalizedEvidenceItem]:
     """Ingest SQLite-compatible SQL dump into memory and extract table rows deterministically."""
     items: List[NormalizedEvidenceItem] = []
     if not file_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_sql_dump",
+                    error_type="FileNotFoundError",
+                    error_message=f"SQL dump file not found: {file_path}",
+                )
+            )
         return items
 
     try:
@@ -185,16 +228,15 @@ def parse_sql_dump(
                     except Exception:
                         embedded = {}
 
-                # Resolve identifiers
-                user_id = (
+                # Resolve identifiers strictly: user_id must be canonical (user_XXXX)
+                raw_ref = (
                     row_dict.get("user_id")
                     or row_dict.get("customer_reference")
                     or row_dict.get("subject_reference")
                     or embedded.get("subject_reference")
                     or embedded.get("user_id")
                 )
-                if user_id:
-                    user_id = str(user_id).strip()
+                user_id = _canonical_user_id(str(raw_ref)) if raw_ref else None
 
                 email = (
                     row_dict.get("email")
@@ -203,6 +245,9 @@ def parse_sql_dump(
                     or row_dict.get("requester_email")
                     or embedded.get("email")
                 )
+                if not email and raw_ref and "@" in str(raw_ref):
+                    email = str(raw_ref).strip()
+
                 phone = (
                     row_dict.get("phone")
                     or row_dict.get("owner_phone")
@@ -257,6 +302,8 @@ def parse_sql_dump(
                     "name": name,
                     "email_hash": email_hash,
                 }
+                if raw_ref:
+                    payload["raw_reference"] = str(raw_ref).strip()
 
                 items.append(
                     NormalizedEvidenceItem(
@@ -276,9 +323,17 @@ def parse_sql_dump(
                 )
 
         conn.close()
-    except Exception as e:
-        # Fail closed on corrupt database dump
-        pass
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_sql_dump",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
@@ -288,10 +343,21 @@ def parse_json_bundle(
     file_id: str,
     captured_at: Optional[str],
     origin: str,
+    error_sink: Optional[List[ParserError]] = None,
 ) -> List[NormalizedEvidenceItem]:
     """Ingest JSON record bundle or archive export deterministically."""
     items: List[NormalizedEvidenceItem] = []
     if not file_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_json_bundle",
+                    error_type="FileNotFoundError",
+                    error_message=f"JSON bundle file not found: {file_path}",
+                )
+            )
         return items
 
     try:
@@ -302,26 +368,131 @@ def parse_json_bundle(
         if isinstance(data, list):
             records = [r for r in data if isinstance(r, dict)]
         elif isinstance(data, dict):
+            # Ingest top-level records if present
             if "records" in data and isinstance(data["records"], list):
-                records = [r for r in data["records"] if isinstance(r, dict)]
-            else:
+                records.extend([r for r in data["records"] if isinstance(r, dict)])
+
+            # Ingest nested snapshots bundle
+            if "snapshots" in data and isinstance(data["snapshots"], list):
+                exp_ts = data.get("exported_at")
+                for snapshot in data["snapshots"]:
+                    if not isinstance(snapshot, dict):
+                        continue
+                    ds = snapshot.get("data_store")
+                    col = snapshot.get("collection")
+                    cap_ts = snapshot.get("captured_at") or exp_ts
+                    for r in snapshot.get("records", []):
+                        if isinstance(r, dict):
+                            rc = dict(r)
+                            if ds:
+                                rc.setdefault("system", ds)
+                            if col:
+                                rc.setdefault("collection", col)
+                            if cap_ts:
+                                rc.setdefault("captured_at", cap_ts)
+                            records.append(rc)
+
+            # Ingest nested service exports
+            if "service_exports" in data and isinstance(data["service_exports"], dict):
+                exp_ts = data.get("exported_at")
+                for svc, cat_dict in data["service_exports"].items():
+                    if isinstance(cat_dict, dict):
+                        for cat, item_list in cat_dict.items():
+                            if isinstance(item_list, list):
+                                for r in item_list:
+                                    if isinstance(r, dict):
+                                        rc = dict(r)
+                                        rc.setdefault("system", svc)
+                                        rc.setdefault("category", cat)
+                                        if exp_ts:
+                                            rc.setdefault("exported_at", exp_ts)
+                                        records.append(rc)
+
+            if not records:
                 records = [data]
 
         for rec in records:
             res_id = str(rec.get("resource_id", "")).strip()
-            user_id = rec.get("user_id") or rec.get("subject_reference") or rec.get("customer_reference")
-            if user_id:
-                user_id = str(user_id).strip()
 
-            email = rec.get("email") or rec.get("owner_email") or rec.get("subject_reference")
-            phone = rec.get("phone") or rec.get("owner_phone")
-            email_hash = rec.get("email_hash")
-            name = rec.get("full_name") or rec.get("display_name")
+            doc = rec.get("document") if isinstance(rec.get("document"), dict) else {}
+            prof = rec.get("profile") if isinstance(rec.get("profile"), dict) else {}
 
-            raw_status = str(rec.get("result") or rec.get("status") or "").upper().strip()
+            raw_ref = (
+                rec.get("user_id")
+                or rec.get("subject_reference")
+                or rec.get("customer_reference")
+                or doc.get("customer_reference")
+                or doc.get("user_id")
+                or prof.get("customer_reference")
+                or prof.get("user_id")
+            )
+            user_id = _canonical_user_id(str(raw_ref)) if raw_ref else None
+
+            email = (
+                rec.get("email")
+                or rec.get("customer_email")
+                or rec.get("owner_email")
+                or rec.get("requester_email")
+                or doc.get("email")
+                or doc.get("owner_email")
+                or prof.get("email")
+            )
+
+            # Check hits documents (search index queries)
+            if not email and "hits" in rec and isinstance(rec["hits"], dict):
+                for d in rec["hits"].get("documents", []):
+                    if isinstance(d, dict) and d.get("email"):
+                        email = d.get("email")
+                        if not raw_ref:
+                            raw_ref = d.get("customer_reference") or d.get("user_id")
+                            user_id = _canonical_user_id(str(raw_ref)) if raw_ref else None
+                        break
+
+            # Check query if it contains email
+            if not email and "query" in rec and "@" in str(rec.get("query")):
+                email = str(rec.get("query")).strip()
+
+            if not email:
+                for ref_cand in (rec.get("subject_reference"), rec.get("customer_reference"), raw_ref):
+                    if ref_cand and "@" in str(ref_cand):
+                        email = str(ref_cand).strip()
+                        break
+
+            phone = (
+                rec.get("phone")
+                or rec.get("owner_phone")
+                or rec.get("requester_phone")
+                or doc.get("phone")
+                or prof.get("phone")
+            )
+            email_hash = rec.get("email_hash") or doc.get("email_hash") or prof.get("email_hash")
+            name = (
+                rec.get("full_name")
+                or rec.get("display_name")
+                or rec.get("requester_name")
+                or rec.get("name")
+                or doc.get("display_name")
+                or doc.get("full_name")
+                or prof.get("full_name")
+            )
+
+            raw_status = str(rec.get("result") or rec.get("status") or rec.get("account_status") or "").upper().strip()
             status = "PRESENT"
-            if raw_status == "NOT_FOUND":
+            if rec.get("status_code") == 404 or (rec.get("profile") is None and "status_code" in rec and rec.get("status_code") != 200):
                 status = "ABSENT"
+            elif rec.get("restore_allowed") is False or rec.get("restore_allowed") == 0 or str(rec.get("restore_allowed")).lower() == "false":
+                status = "BLOCKED"
+            elif rec.get("enabled") is False or rec.get("enabled") == 0 or str(rec.get("enabled")).lower() == "false" or str(rec.get("last_delivery_status", "")).lower() == "stopped":
+                status = "DISABLED"
+            elif rec.get("category") == "profiles" and not email and not raw_ref:
+                status = "ANONYMIZED"
+            elif rec.get("category") == "tickets" and not rec.get("requester_email") and not rec.get("requester_name") and not rec.get("requester_phone"):
+                status = "REDACTED"
+            elif raw_status in ("ABSENT", "NOT_FOUND", "DELETED"):
+                if "tombstone" in res_id:
+                    status = "REDACTED" if (not name and not email and not phone) else "PRESENT"
+                else:
+                    status = "ABSENT"
             elif raw_status == "ACTIVE":
                 status = "ACTIVE"
             elif raw_status == "DISABLED":
@@ -334,10 +505,16 @@ def parse_json_bundle(
                 status = "PRESENT"
 
             rec_type = str(rec.get("record_type", "")).upper()
-            retention_flag = rec_type == "LEGAL_HOLD_RECORD" or "retention_until" in rec or "expires_at" in rec
+            retention_flag = (
+                rec_type == "LEGAL_HOLD_RECORD"
+                or "retention_until" in rec
+                or rec.get("system") == "security_service"
+                or rec.get("collection") == "security_audit_events"
+            )
 
             evt_ts = (
-                rec.get("created_at")
+                rec.get("observed_at")
+                or rec.get("created_at")
                 or rec.get("exported_at")
                 or rec.get("recorded_at")
                 or rec.get("captured_at")
@@ -352,6 +529,12 @@ def parse_json_bundle(
                 "name": name,
                 "email_hash": email_hash,
             }
+            if raw_ref:
+                payload["raw_reference"] = str(raw_ref).strip()
+            if rec.get("subject_reference"):
+                payload["subject_reference"] = str(rec["subject_reference"]).strip()
+            if rec.get("customer_reference"):
+                payload["customer_reference"] = str(rec["customer_reference"]).strip()
 
             items.append(
                 NormalizedEvidenceItem(
@@ -363,15 +546,23 @@ def parse_json_bundle(
                     resource_id=res_id,
                     system_id=system_id,
                     user_id=user_id if user_id else None,
-                    action=rec_type or "RECORD_OBSERVED",
+                    action=rec_type or rec.get("action") or rec.get("event_code") or "RECORD_OBSERVED",
                     status=status,
                     retention_flag=retention_flag,
                     raw_payload=payload,
                 )
             )
-    except Exception:
-        # Corrupt JSON fails closed
-        pass
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_json_bundle",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
@@ -381,10 +572,21 @@ def parse_handover_txt(
     file_id: str,
     captured_at: Optional[str],
     origin: str,
+    error_sink: Optional[List[ParserError]] = None,
 ) -> List[NormalizedEvidenceItem]:
     """Ingest shift handover pipe-separated text document."""
     items: List[NormalizedEvidenceItem] = []
     if not file_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_handover_txt",
+                    error_type="FileNotFoundError",
+                    error_message=f"Text handover file not found: {file_path}",
+                )
+            )
         return items
 
     line_pattern = re.compile(
@@ -415,7 +617,7 @@ def parse_handover_txt(
                 elif raw_status in ("FOUND", "IDENTIFIABLE", "PRESENT"):
                     status = "PRESENT"
 
-                user_id = subj_ref if subj_ref.startswith("user_") else None
+                user_id = _canonical_user_id(subj_ref)
                 email = subj_ref if "@" in subj_ref else None
 
                 payload = {
@@ -442,8 +644,17 @@ def parse_handover_txt(
                         raw_payload=payload,
                     )
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_handover_txt",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
@@ -453,10 +664,21 @@ def parse_log_file(
     file_id: str,
     captured_at: Optional[str],
     origin: str,
+    error_sink: Optional[List[ParserError]] = None,
 ) -> List[NormalizedEvidenceItem]:
     """Ingest multi-dialect service log file deterministically."""
     items: List[NormalizedEvidenceItem] = []
     if not file_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_log_file",
+                    error_type="FileNotFoundError",
+                    error_message=f"Log file not found: {file_path}",
+                )
+            )
         return items
 
     ts_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))")
@@ -484,21 +706,51 @@ def parse_log_file(
                 # Otherwise extract key-value attributes
                 if not payload:
                     for k, v1, v2, v3 in kv_pattern.findall(sline):
-                        val = v1 if v1 != "" else (v2 if v2 != "" else v3)
+                        val = (v1 if v1 != "" else (v2 if v2 != "" else v3)).strip().strip('"\'\\').strip()
                         payload[k] = val
 
-                res_id = str(payload.get("resource_id", "")).strip()
+                    # Unpack nested key-values if message attribute has escaped quotes or kv pairs
+                    msg = payload.get("message", "")
+                    if msg and ("=" in msg or '\\"' in sline):
+                        for k, v1, v2, v3 in kv_pattern.findall(sline.replace('\\"', '"')):
+                            val = (v1 if v1 != "" else (v2 if v2 != "" else v3)).strip().strip('"\'\\').strip()
+                            if val:
+                                payload[k] = val
 
-                user_id = (
+                    # Detect pipe-delimited format: TIMESTAMP | LEVEL | SERVICE | TRACE_ID | EVENT | KVs
+                    if "|" in sline:
+                        parts = [p.strip() for p in sline.split("|")]
+                        if len(parts) >= 5:
+                            if "service" not in payload:
+                                payload["service"] = parts[2]
+                            if "trace_id" not in payload:
+                                payload["trace_id"] = parts[3]
+                            if "event" not in payload:
+                                payload["event"] = parts[4]
+
+                    # Detect syslog header format: <PRI>VERSION TIMESTAMP HOST SERVICE TRACE_ID
+                    m_syslog = re.search(r'<\d+>\d+\s+\S+\s+([a-zA-Z0-9_]+)\s+(tr-\d+|rb-[\d-]+)', sline)
+                    if m_syslog:
+                        if "service" not in payload:
+                            payload["service"] = m_syslog.group(1)
+                        if "trace_id" not in payload:
+                            payload["trace_id"] = m_syslog.group(2)
+
+                    m_tr = re.search(r'\b(tr-\d+|rb-[\d-]+)\b', sline)
+                    if m_tr and "trace_id" not in payload:
+                        payload["trace_id"] = m_tr.group(1)
+
+                res_id = str(payload.get("resource_id", "")).strip().strip('"\'\\').strip()
+
+                raw_ref = (
                     payload.get("user_id")
                     or payload.get("customer_reference")
                     or payload.get("subject_reference")
                     or payload.get("correlation_key")
                 )
-                if user_id:
-                    user_id = str(user_id).strip()
-                    if not user_id.startswith("user_"):
-                        user_id = None
+                if raw_ref:
+                    raw_ref = str(raw_ref).strip().strip('"\'\\').strip()
+                user_id = _canonical_user_id(str(raw_ref)) if raw_ref else None
 
                 email = (
                     payload.get("email")
@@ -510,15 +762,34 @@ def parse_log_file(
                     or payload.get("scan_key")
                     or payload.get("matched_value")
                 )
-                if email and "@" not in str(email):
+                if email:
+                    email = str(email).strip().strip('"\'\\').strip()
+                if not email and raw_ref and "@" in str(raw_ref):
+                    email = str(raw_ref).strip().strip('"\'\\').strip()
+                elif email and "@" not in str(email):
                     email = None
 
                 phone = payload.get("phone")
+                if phone:
+                    phone = str(phone).strip().strip('"\'\\').strip()
+                email_hash = payload.get("email_hash")
+                if email_hash:
+                    email_hash = str(email_hash).strip().strip('"\'\\').strip()
+                if not email_hash and raw_ref and len(str(raw_ref).strip()) == 64 and re.match(r"^[0-9a-fA-F]{64}$", str(raw_ref).strip()):
+                    email_hash = str(raw_ref).strip().lower()
+                    payload["email_hash"] = email_hash
 
+                action = str(payload.get("event") or payload.get("action") or "LOG_ENTRY").strip()
                 raw_status = str(payload.get("result") or payload.get("status") or "").upper().strip()
                 status = "PRESENT"
-                if raw_status == "NOT_FOUND":
+                if raw_status == "NOT_FOUND" or payload.get("http_status") == "404" or payload.get("rows") == "0":
                     status = "ABSENT"
+                elif action.endswith("_started") or action.endswith("_start"):
+                    status = None
+                elif str(payload.get("restore_allowed", "")).lower() == "false":
+                    status = "BLOCKED"
+                elif str(payload.get("enabled", "")).lower() == "false" or str(payload.get("last_delivery_status", "")).lower() == "stopped":
+                    status = "DISABLED"
                 elif raw_status == "ACTIVE":
                     status = "ACTIVE"
                 elif raw_status == "DISABLED":
@@ -529,9 +800,7 @@ def parse_log_file(
                     status = "ANONYMIZED"
                 elif raw_status in ("FOUND", "IDENTIFIABLE", "SUCCESS", "PRESENT"):
                     status = "PRESENT"
-
-                action = str(payload.get("event") or payload.get("action") or "LOG_ENTRY").strip()
-                service = str(payload.get("service") or payload.get("system") or "").strip()
+                service = str(payload.get("service") or payload.get("system") or payload.get("function") or "").strip()
                 system_id = service or infer_system_id(res_id, default=origin)
 
                 # Attach line index to payload for deterministic debugging
@@ -540,6 +809,10 @@ def parse_log_file(
                     payload["email"] = email
                 if phone:
                     payload["phone"] = phone
+                if email_hash:
+                    payload["email_hash"] = email_hash
+                if raw_ref:
+                    payload["raw_reference"] = str(raw_ref).strip()
 
                 items.append(
                     NormalizedEvidenceItem(
@@ -557,8 +830,47 @@ def parse_log_file(
                         raw_payload=payload,
                     )
                 )
-    except Exception:
-        pass
+
+        # Correlate multi-line traces (e.g. started -> completed)
+        by_trace: Dict[str, List[NormalizedEvidenceItem]] = {}
+        for it in items:
+            tr = it.raw_payload.get("trace_id") or it.raw_payload.get("requestId") or it.raw_payload.get("request_id")
+            if tr and str(tr).strip() and not str(tr).strip().startswith("collector"):
+                by_trace.setdefault(str(tr).strip(), []).append(it)
+
+        for tr, tr_items in by_trace.items():
+            lookup_email = None
+            lookup_uid = None
+            has_404 = False
+            for it in tr_items:
+                em = it.raw_payload.get("lookup_key") or it.raw_payload.get("email")
+                if em and "@" in str(em):
+                    lookup_email = str(em).strip()
+                uid = it.raw_payload.get("customer_reference") or it.raw_payload.get("user_id")
+                if uid:
+                    lookup_uid = _canonical_user_id(str(uid))
+                if it.raw_payload.get("http_status") == "404" or it.raw_payload.get("rows") == "0":
+                    has_404 = True
+
+            if has_404 or lookup_email or lookup_uid:
+                for it in tr_items:
+                    if lookup_email and not it.raw_payload.get("email"):
+                        it.raw_payload["email"] = lookup_email
+                    if lookup_uid and not it.user_id:
+                        it.user_id = lookup_uid
+                    if has_404 and (it.raw_payload.get("event") == "profile_lookup_completed" or it.action == "profile_lookup_completed"):
+                        it.status = "ABSENT"
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_log_file",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
@@ -568,10 +880,21 @@ def parse_pdf_document(
     file_id: str,
     captured_at: Optional[str],
     origin: str,
+    error_sink: Optional[List[ParserError]] = None,
 ) -> List[NormalizedEvidenceItem]:
     """Ingest ReportLab PDF document using stdlib Adobe ASCII85 + Flate stream decoding."""
     items: List[NormalizedEvidenceItem] = []
     if not file_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_pdf_document",
+                    error_type="FileNotFoundError",
+                    error_message=f"PDF document not found: {file_path}",
+                )
+            )
         return items
 
     try:
@@ -630,8 +953,8 @@ def parse_pdf_document(
         full_doc_text = "\n".join(extracted_lines)
 
         # Extract identifiers from decoded document text
-        uid_match = re.search(r"\b(user_\d+)\b", full_doc_text)
-        user_id = uid_match.group(1) if uid_match else None
+        uid_match = re.search(r"\b(user_\d+)\b", full_doc_text, re.IGNORECASE)
+        user_id = _canonical_user_id(uid_match.group(1)) if uid_match else None
 
         email_match = re.search(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", full_doc_text)
         email = email_match.group(1) if email_match else None
@@ -700,8 +1023,17 @@ def parse_pdf_document(
                 raw_payload=payload,
             )
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_pdf_document",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
@@ -711,63 +1043,99 @@ def parse_png_metadata(
     file_id: str,
     captured_at: Optional[str],
     origin: str,
+    error_sink: Optional[List[ParserError]] = None,
 ) -> List[NormalizedEvidenceItem]:
     """Inspect PNG administration screenshot metadata deterministically."""
     items: List[NormalizedEvidenceItem] = []
     if not file_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_png_metadata",
+                    error_type="FileNotFoundError",
+                    error_message=f"PNG screenshot not found: {file_path}",
+                )
+            )
         return items
 
-    size_bytes = os.path.getsize(file_path)
-    dimensions: Tuple[int, int] = (0, 0)
-    mode = "RGB"
-    img_fmt = "PNG"
+    try:
+        size_bytes = os.path.getsize(file_path)
+        dimensions: Tuple[int, int] = (0, 0)
+        mode = "RGB"
+        img_fmt = "PNG"
 
-    if Image is not None:
-        try:
-            with Image.open(file_path) as img:
-                dimensions = img.size
-                mode = img.mode
-                img_fmt = img.format or "PNG"
-        except Exception:
-            pass
+        if Image is not None:
+            try:
+                with Image.open(file_path) as img:
+                    dimensions = img.size
+                    mode = img.mode
+                    img_fmt = img.format or "PNG"
+            except Exception:
+                pass
 
-    # Record explicit OCR status and metadata
-    payload = {
-        "ocr_available": False,
-        "ocr_engine": None,
-        "file_size": size_bytes,
-        "dimensions": list(dimensions),
-        "mode": mode,
-        "format": img_fmt,
-        "filename": file_path.name,
-    }
+        # Record explicit OCR status and metadata
+        payload = {
+            "ocr_available": False,
+            "ocr_engine": None,
+            "file_size": size_bytes,
+            "dimensions": list(dimensions),
+            "mode": mode,
+            "format": img_fmt,
+            "filename": file_path.name,
+        }
 
-    system_id = origin
+        system_id = origin
 
-    items.append(
-        NormalizedEvidenceItem(
-            evidence_id=file_id,
-            evidence_type="PNG",
-            origin=origin,
-            captured_at=captured_at,
-            event_timestamp=captured_at,
-            resource_id="",
-            system_id=system_id,
-            user_id=None,
-            action="ADMIN_SCREENSHOT_CAPTURED",
-            status="PRESENT",
-            retention_flag=False,
-            raw_payload=payload,
+        items.append(
+            NormalizedEvidenceItem(
+                evidence_id=file_id,
+                evidence_type="PNG",
+                origin=origin,
+                captured_at=captured_at,
+                event_timestamp=captured_at,
+                resource_id="",
+                system_id=system_id,
+                user_id=None,
+                action="ADMIN_SCREENSHOT_CAPTURED",
+                status="PRESENT",
+                retention_flag=False,
+                raw_payload=payload,
+            )
         )
-    )
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id=file_id,
+                    file_path=str(file_path),
+                    parser="parse_png_metadata",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
 
-def parse_system_activity(csv_path: Path) -> List[NormalizedEvidenceItem]:
+def parse_system_activity(
+    csv_path: Path,
+    error_sink: Optional[List[ParserError]] = None,
+) -> List[NormalizedEvidenceItem]:
     """Ingest operational records from dataset/system_activity.csv citing official activity_id."""
     items: List[NormalizedEvidenceItem] = []
     if not csv_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id="system_activity",
+                    file_path=str(csv_path),
+                    parser="parse_system_activity",
+                    error_type="FileNotFoundError",
+                    error_message=f"System activity CSV not found: {csv_path}",
+                )
+            )
         return items
 
     try:
@@ -784,15 +1152,30 @@ def parse_system_activity(csv_path: Path) -> List[NormalizedEvidenceItem]:
                 rep_res = str(row.get("reported_result", "")).upper().strip()
                 details = row.get("details", "")
 
-                status = "PRESENT" if rep_res in ("SUCCESS", "COMPLETED") else None
+                ev_type_upper = event_type.upper().strip()
+                status = None
+                if ev_type_upper == "DELETE_RECORD":
+                    status = "ABSENT" if rep_res in ("SUCCESS", "COMPLETED") else "PRESENT"
+                elif ev_type_upper == "ANONYMIZE_RECORD":
+                    status = "ANONYMIZED" if rep_res in ("SUCCESS", "COMPLETED") else "PRESENT"
+                elif ev_type_upper == "REDACT_RECORD":
+                    status = "REDACTED" if rep_res in ("SUCCESS", "COMPLETED") else "PRESENT"
+                elif ev_type_upper == "BLOCK_RESTORE":
+                    status = "BLOCKED" if rep_res in ("SUCCESS", "COMPLETED") else "ACTIVE"
+                elif ev_type_upper == "DISABLE_DATA_FLOW":
+                    status = "DISABLED" if rep_res in ("SUCCESS", "COMPLETED") else "ACTIVE"
+                elif ev_type_upper == "CHECK_DATA_FLOW":
+                    status = "ACTIVE" if "remains enabled" in details.lower() else "DISABLED"
+                elif rep_res in ("SUCCESS", "COMPLETED"):
+                    status = "PRESENT"
                 system_id = infer_system_id(
                     res_id,
                     default=str(row.get("target_system") or row.get("source_system") or ""),
                 )
 
                 # Search details for referenced user_id or email
-                uid_match = re.search(r"\b(user_\d+)\b", details)
-                user_id = uid_match.group(1) if uid_match else None
+                uid_match = re.search(r"\b(user_\d+)\b", details, re.IGNORECASE)
+                user_id = _canonical_user_id(uid_match.group(1)) if uid_match else None
 
                 email_match = re.search(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", details)
                 email = email_match.group(1) if email_match else None
@@ -817,16 +1200,38 @@ def parse_system_activity(csv_path: Path) -> List[NormalizedEvidenceItem]:
                         raw_payload=payload,
                     )
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id="system_activity",
+                    file_path=str(csv_path),
+                    parser="parse_system_activity",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
 
-def parse_user_audit_log(csv_path: Path) -> List[NormalizedEvidenceItem]:
+def parse_user_audit_log(
+    csv_path: Path,
+    error_sink: Optional[List[ParserError]] = None,
+) -> List[NormalizedEvidenceItem]:
     """Ingest identity change audit history from dataset/user_audit_log.csv citing official audit_id."""
     items: List[NormalizedEvidenceItem] = []
     if not csv_path.is_file():
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id="user_audit_log",
+                    file_path=str(csv_path),
+                    parser="parse_user_audit_log",
+                    error_type="FileNotFoundError",
+                    error_message=f"User audit log CSV not found: {csv_path}",
+                )
+            )
         return items
 
     try:
@@ -838,7 +1243,8 @@ def parse_user_audit_log(csv_path: Path) -> List[NormalizedEvidenceItem]:
                     continue
 
                 ts = row.get("event_time") or row.get("timestamp")
-                user_id = str(row.get("user_id", "")).strip()
+                raw_uid = str(row.get("user_id", "")).strip()
+                user_id = _canonical_user_id(raw_uid)
                 field_chg = str(row.get("field_name") or row.get("field_changed") or "").strip()
                 old_val = row.get("old_value")
                 new_val = row.get("new_value")
@@ -871,8 +1277,17 @@ def parse_user_audit_log(csv_path: Path) -> List[NormalizedEvidenceItem]:
                         raw_payload=payload,
                     )
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        if error_sink is not None:
+            error_sink.append(
+                ParserError(
+                    file_id="user_audit_log",
+                    file_path=str(csv_path),
+                    parser="parse_user_audit_log",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:300],
+                )
+            )
 
     return items
 
@@ -880,14 +1295,6 @@ def parse_user_audit_log(csv_path: Path) -> List[NormalizedEvidenceItem]:
 # -----------------------------------------------------------------------------
 # Inverted Corpus Index
 # -----------------------------------------------------------------------------
-
-def _canonical_user_id(uid: Optional[str]) -> Optional[str]:
-    """Normalize canonical user_id string (user_XX) or return None if absent."""
-    if not uid or not isinstance(uid, str):
-        return None
-    cleaned = uid.strip().lower()
-    return cleaned if cleaned.startswith("user_") else None
-
 
 def _has_canonical_user_id_conflict(canonical_uid: Optional[str], item_uid: Optional[str]) -> bool:
     """Return True if both canonical_uid and item_uid are provided and do not match."""
@@ -905,6 +1312,25 @@ class EvidenceCorpusIndex:
         self._by_identifier: Dict[str, List[NormalizedEvidenceItem]] = {}
         self._by_resource_id: Dict[str, List[NormalizedEvidenceItem]] = {}
         self._by_evidence_id: Dict[str, List[NormalizedEvidenceItem]] = {}
+        self.parsing_errors: List[ParserError] = []
+
+    def record_parsing_error(
+        self,
+        file_id: str,
+        file_path: str,
+        parser: str,
+        error_type: str,
+        error_message: str,
+    ) -> None:
+        """Deterministically record a structured parser failure."""
+        err = ParserError(
+            file_id=str(file_id).strip(),
+            file_path=str(file_path).strip(),
+            parser=str(parser).strip(),
+            error_type=str(error_type).strip(),
+            error_message=str(error_message).strip()[:300],
+        )
+        self.parsing_errors.append(err)
 
     def index_item(self, item: NormalizedEvidenceItem) -> None:
         """Register a single normalized evidence item into the inverted indices."""
@@ -920,9 +1346,9 @@ class EvidenceCorpusIndex:
             if res_clean:
                 self._by_resource_id.setdefault(res_clean, []).append(item)
 
-        # Index by user_id
+        # Index by user_id strictly if canonical
         if item.user_id:
-            uid_clean = item.user_id.strip()
+            uid_clean = _canonical_user_id(item.user_id)
             if uid_clean:
                 self._by_user_id.setdefault(uid_clean, []).append(item)
 
@@ -953,9 +1379,10 @@ class EvidenceCorpusIndex:
                     tokens.add(norm)
 
         # Email hashes
-        hash_val = payload.get("email_hash")
-        if hash_val and isinstance(hash_val, str) and len(hash_val.strip()) == 64:
-            tokens.add(hash_val.strip().lower())
+        for key in ("email_hash", "correlation_key"):
+            hash_val = payload.get(key)
+            if hash_val and isinstance(hash_val, str) and len(hash_val.strip()) == 64:
+                tokens.add(hash_val.strip().lower())
 
         # Names
         for key in ("name", "full_name", "display_name", "requester_name"):
@@ -1159,39 +1586,60 @@ class EvidenceCorpus:
                             fpath = alt_path2
 
                 if not fpath.is_file():
+                    index.record_parsing_error(
+                        file_id=file_id,
+                        file_path=raw_path,
+                        parser="manifest_resolver",
+                        error_type="FileNotFoundError",
+                        error_message=f"Manifest file could not be resolved on disk: {raw_path}",
+                    )
                     continue
 
                 ext = fpath.suffix.lower()
                 items: List[NormalizedEvidenceItem] = []
 
                 if ext == ".sql":
-                    items = parse_sql_dump(fpath, file_id, captured_at, origin)
+                    items = parse_sql_dump(fpath, file_id, captured_at, origin, error_sink=index.parsing_errors)
                 elif ext == ".json":
-                    items = parse_json_bundle(fpath, file_id, captured_at, origin)
+                    items = parse_json_bundle(fpath, file_id, captured_at, origin, error_sink=index.parsing_errors)
                 elif ext == ".txt":
-                    items = parse_handover_txt(fpath, file_id, captured_at, origin)
+                    items = parse_handover_txt(fpath, file_id, captured_at, origin, error_sink=index.parsing_errors)
                 elif ext == ".log":
-                    items = parse_log_file(fpath, file_id, captured_at, origin)
+                    items = parse_log_file(fpath, file_id, captured_at, origin, error_sink=index.parsing_errors)
                 elif ext == ".pdf":
-                    items = parse_pdf_document(fpath, file_id, captured_at, origin)
+                    items = parse_pdf_document(fpath, file_id, captured_at, origin, error_sink=index.parsing_errors)
                 elif ext == ".png":
-                    items = parse_png_metadata(fpath, file_id, captured_at, origin)
+                    items = parse_png_metadata(fpath, file_id, captured_at, origin, error_sink=index.parsing_errors)
+                else:
+                    index.record_parsing_error(
+                        file_id=file_id,
+                        file_path=str(fpath),
+                        parser="build_index",
+                        error_type="UnsupportedFormatError",
+                        error_message=f"Unsupported evidence file format: {ext}",
+                    )
 
                 for item in items:
                     index.index_item(item)
 
         # Ingest operational system activity
-        if self.activity_path and self.activity_path.is_file():
-            for item in parse_system_activity(self.activity_path):
+        if self.activity_path:
+            for item in parse_system_activity(self.activity_path, error_sink=index.parsing_errors):
                 index.index_item(item)
 
         # Ingest user audit log
-        if self.audit_path and self.audit_path.is_file():
-            for item in parse_user_audit_log(self.audit_path):
+        if self.audit_path:
+            for item in parse_user_audit_log(self.audit_path, error_sink=index.parsing_errors):
                 index.index_item(item)
 
         self._index = index
         return index
+
+    @property
+    def parsing_errors(self) -> List[ParserError]:
+        """Access structured parsing errors recorded during index construction."""
+        idx = self.build_index()
+        return list(idx.parsing_errors)
 
     def get_subject_evidence(
         self,

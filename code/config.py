@@ -11,6 +11,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 @dataclass
 class AppConfig:
@@ -69,6 +75,11 @@ class AppConfig:
     @property
     def evidence_dir(self) -> Path:
         return self.dataset_dir / "evidence"
+
+    @property
+    def gemini_api_key(self) -> Optional[str]:
+        """Optional Gemini API key for external LLM or multimodal analysis."""
+        return os.getenv("GEMINI_API_KEY")
 
     def validate_inputs(self, use_sample: bool = False) -> Tuple[bool, List[str]]:
         """Validate presence of all required input files.

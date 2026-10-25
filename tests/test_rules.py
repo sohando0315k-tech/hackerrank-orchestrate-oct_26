@@ -296,3 +296,45 @@ def test_multilingual_conjugations_and_transliterations(classifier):
     assert r_nl.intent == RequestIntent.DELETION
     assert r_nl.is_deletion_authorized
     assert r_nl.detected_language == "Dutch"
+
+# -----------------------------------------------------------------------------
+# Sprint 3C Tests: Deletion Audit and Verification Intent
+# -----------------------------------------------------------------------------
+
+def test_deletion_audit_and_confirmation_requests() -> None:
+    """Verify that requests asking to verify, audit, or confirm past deletion authorize deletion auditing."""
+    classifier = DeletionIntentClassifier()
+
+    cases = [
+        "Could you verify that the profile is gone and that anything related to it has been dealt with?",
+        "Please check the latest state and confirm that the profile is gone.",
+        "Can you verify that my account was deleted? A search result with a similar email belongs to someone else.",
+        "I was told the account had been deleted, but I can still find traces in search, support, and analytics. Please handle them and disable any synchronization that could recreate them.",
+        "Please audit the deletion as it stood when my request was reviewed. I want confirmation that the account was fully removed.",
+        "The privacy page still says my request failed. Please inspect the actual systems and tell me whether the account and identity records are truly gone.",
+    ]
+    for prompt in cases:
+        res = classifier.classify(prompt)
+        assert res.is_deletion_authorized is True, f"Failed on prompt: {prompt}"
+        assert res.intent == RequestIntent.DELETION, f"Expected DELETION intent for prompt: {prompt}"
+
+
+def test_deletion_audit_negation_takes_precedence() -> None:
+    """Explicit refusal or negation must override audit requests."""
+    classifier = DeletionIntentClassifier()
+    prompt = "Please verify my account, but do not delete my profile or remove any records."
+    res = classifier.classify(prompt)
+    assert res.is_deletion_authorized is False
+
+
+def test_historical_mention_without_audit_instructions_remains_non_deletion() -> None:
+    """Pure historical observation without deletion audit instructions remains non-deletion."""
+    classifier = DeletionIntentClassifier()
+
+    r1 = classifier.classify("My account was deleted last year. Can you send me a copy of my old invoices?")
+    assert r1.is_deletion_authorized is False
+    assert r1.intent == RequestIntent.ACCESS
+
+    r2 = classifier.classify("My account was deleted last month. Can you help me reset my password?")
+    assert r2.is_deletion_authorized is False
+    assert r2.intent == RequestIntent.ACCOUNT_RECOVERY

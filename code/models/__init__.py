@@ -5,9 +5,9 @@ Strictly adheres to the official HackerRank Orchestrate competition specificatio
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 class DeletionStatus(str, Enum):

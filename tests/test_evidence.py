@@ -28,6 +28,9 @@ from code.evidence import (
     EvidenceCorpusIndex,
     EvidenceReference,
     NormalizedEvidenceItem,
+    ParserError,
+    _canonical_user_id,
+    canonical_user_id,
     infer_system_id,
     parse_handover_txt,
     parse_json_bundle,
@@ -940,3 +943,318 @@ def test_regression_deterministic_ordering_with_isolation_guards() -> None:
 
     assert [r.evidence_id for r in res_a] == ["ev_01", "ev_02"]
     assert [r.evidence_id for r in res_b] == ["ev_01", "ev_02"]
+
+
+# -----------------------------------------------------------------------------
+# 13. Sprint 2.1 — Evidence Index Hardening Regressions
+# -----------------------------------------------------------------------------
+
+def test_canonical_user_id_normalization_rules() -> None:
+    """Verify strict user_id normalization: accepts only user_ followed by digits."""
+    # Valid canonical IDs
+    assert _canonical_user_id("user_123") == "user_123"
+    assert _canonical_user_id("USER_456") == "user_456"
+    assert _canonical_user_id("user_04") == "user_04"
+    assert canonical_user_id("user_0001") == "user_0001"
+
+    # Malformed or non-canonical IDs must return None
+    assert _canonical_user_id("user_") is None
+    assert _canonical_user_id("user_abc") is None
+    assert _canonical_user_id("user-123") is None
+    assert _canonical_user_id("user_12a") is None
+    assert _canonical_user_id("aarav.m2118@zoho.com") is None
+    assert _canonical_user_id("mateo.alvarez@gmail.com") is None
+    assert _canonical_user_id("Thandiwe Ndlovu") is None
+    assert _canonical_user_id("") is None
+    assert _canonical_user_id("   ") is None
+    assert _canonical_user_id(None) is None
+    assert _canonical_user_id(123) is None  # type: ignore[arg-type]
+
+
+def test_json_bundle_parser_email_in_subject_reference_preserves_email_not_user_id(tmp_path: Path) -> None:
+    """Verify that email-valued subject_reference strings are stored as emails, not user_id."""
+    bundle_file = tmp_path / "connector_test.json"
+    bundle_data = {
+        "exported_at": "2026-08-12T09:00:00Z",
+        "origin": "integration_service",
+        "records": [
+            {
+                "recorded_at": "2026-08-12T09:00:00Z",
+                "system": "account_service",
+                "resource_id": "account_1084",
+                "record_type": "USER_PROFILE",
+                "result": "NOT_FOUND",
+                "subject_reference": "mateo.alvarez@gmail.com",
+            },
+            {
+                "recorded_at": "2026-08-12T09:00:00Z",
+                "system": "account_service",
+                "resource_id": "account_2000",
+                "record_type": "USER_PROFILE",
+                "result": "FOUND",
+                "customer_reference": "user_789",
+            },
+            {
+                "recorded_at": "2026-08-12T09:00:00Z",
+                "system": "account_service",
+                "resource_id": "account_3000",
+                "record_type": "USER_PROFILE",
+                "result": "FOUND",
+                "user_id": "invalid_user_tag",
+            },
+        ],
+    }
+    bundle_file.write_text(json.dumps(bundle_data), encoding="utf-8")
+
+    errors: List[ParserError] = []
+    items = parse_json_bundle(bundle_file, "ev_json_test", "2026-08-12T09:00:00Z", "integration", error_sink=errors)
+    assert len(items) == 3
+    assert len(errors) == 0
+
+    # Record 1: email in subject_reference must NOT populate user_id, but must populate email
+    item1 = items[0]
+    assert item1.user_id is None
+    assert item1.raw_payload["email"] == "mateo.alvarez@gmail.com"
+    assert item1.raw_payload["subject_reference"] == "mateo.alvarez@gmail.com"
+
+    # Record 2: valid canonical user_id must be preserved
+    item2 = items[1]
+    assert item2.user_id == "user_789"
+
+    # Record 3: malformed user_id must be None
+    item3 = items[2]
+    assert item3.user_id is None
+
+
+def test_structured_parser_error_recording_and_graceful_continuation(tmp_path: Path) -> None:
+    """Verify that parser failures are recorded in index.parsing_errors and do not block valid files."""
+    ev_dir = tmp_path / "evidence"
+    ev_dir.mkdir()
+
+    # 1. Valid JSON file
+    valid_json = ev_dir / "valid.json"
+    valid_json.write_text(
+        json.dumps([{"resource_id": "res_valid", "user_id": "user_100", "result": "ACTIVE"}]),
+        encoding="utf-8",
+    )
+
+    # 2. Corrupt SQL file
+    corrupt_sql = ev_dir / "corrupt.sql"
+    corrupt_sql.write_text("THIS IS NOT SQL SYNTAX !@#$", encoding="utf-8")
+
+    # 3. Missing file referenced in manifest
+    missing_path = ev_dir / "does_not_exist.json"
+
+    # Create manifest
+    manifest_csv = tmp_path / "manifest.csv"
+    manifest_df = pd.DataFrame([
+        {"file_id": "ev_valid", "file_path": str(valid_json), "origin": "valid_svc", "captured_at": "2026-09-01T00:00:00Z"},
+        {"file_id": "ev_corrupt", "file_path": str(corrupt_sql), "origin": "sql_svc", "captured_at": "2026-09-01T00:00:00Z"},
+        {"file_id": "ev_missing", "file_path": str(missing_path), "origin": "missing_svc", "captured_at": "2026-09-01T00:00:00Z"},
+    ])
+    manifest_df.to_csv(manifest_csv, index=False)
+
+    corpus = EvidenceCorpus(evidence_dir=ev_dir, manifest_path=manifest_csv)
+    index = corpus.build_index()
+
+    # Valid file was processed successfully despite corrupted and missing sibling files
+    assert len(index._all_items) == 1
+    assert index._all_items[0].resource_id == "res_valid"
+    assert index._all_items[0].user_id == "user_100"
+
+    # Exactly 2 structured parsing errors recorded
+    assert len(index.parsing_errors) == 2
+    err_by_id = {e.file_id: e for e in index.parsing_errors}
+
+    # Error 1: Corrupted SQL file
+    assert "ev_corrupt" in err_by_id
+    err_corrupt = err_by_id["ev_corrupt"]
+    assert err_corrupt.parser == "parse_sql_dump"
+    assert "DatabaseError" in err_corrupt.error_type or "OperationalError" in err_corrupt.error_type
+    assert len(err_corrupt.error_message) > 0
+    assert err_corrupt.to_dict()["file_id"] == "ev_corrupt"
+
+    # Error 2: Missing file
+    assert "ev_missing" in err_by_id
+    err_missing = err_by_id["ev_missing"]
+    assert err_missing.parser == "manifest_resolver"
+    assert err_missing.error_type == "FileNotFoundError"
+
+    # Property on EvidenceCorpus reflects the same errors
+    assert len(corpus.parsing_errors) == 2
+
+
+def test_parsers_reject_malformed_user_ids_across_formats(tmp_path: Path) -> None:
+    """Verify that SQL, LOG, and HANDOVER parsers reject non-canonical user IDs."""
+    # 1. SQL with malformed user_id
+    sql_file = tmp_path / "test_malformed.sql"
+    sql_content = """
+    CREATE TABLE test_table (resource_id TEXT, user_id TEXT, email TEXT);
+    INSERT INTO test_table VALUES ('res_01', 'not_canonical_user', 'user@example.com');
+    INSERT INTO test_table VALUES ('res_02', 'user_777', 'canonical@example.com');
+    """
+    sql_file.write_text(sql_content, encoding="utf-8")
+    sql_items = parse_sql_dump(sql_file, "ev_sql_malformed", "2026-09-01T00:00:00Z", "test")
+    assert len(sql_items) == 2
+    assert sql_items[0].user_id is None  # 'not_canonical_user' rejected
+    assert sql_items[0].raw_payload["raw_reference"] == "not_canonical_user"
+    assert sql_items[1].user_id == "user_777"  # 'user_777' accepted
+
+    # 2. Handover text with email in subject_reference
+    txt_file = tmp_path / "test_handover.txt"
+    txt_file.write_text(
+        "- 2026-09-01T12:00:00Z | svc | res_03 | NOTE | FOUND | user_email@example.com\n"
+        "- 2026-09-01T12:00:00Z | svc | res_04 | NOTE | FOUND | user_888\n",
+        encoding="utf-8",
+    )
+    txt_items = parse_handover_txt(txt_file, "ev_txt_test", "2026-09-01T12:00:00Z", "test")
+    assert len(txt_items) == 2
+    assert txt_items[0].user_id is None
+    assert txt_items[0].raw_payload["email"] == "user_email@example.com"
+    assert txt_items[1].user_id == "user_888"
+
+    # 3. Log file with malformed user_id
+    log_file = tmp_path / "test_malformed.log"
+    log_file.write_text(
+        "2026-09-01T12:00:00Z user_id=invalid_id resource_id=log_res_01 email=person@example.com result=SUCCESS\n"
+        "2026-09-01T12:00:00Z user_id=user_999 resource_id=log_res_02 email=person2@example.com result=SUCCESS\n",
+        encoding="utf-8",
+    )
+    log_items = parse_log_file(log_file, "ev_log_test", "2026-09-01T12:00:00Z", "test")
+    assert len(log_items) == 2
+    assert log_items[0].user_id is None
+    assert log_items[1].user_id == "user_999"
+
+
+def test_full_real_dataset_corpus_strictly_canonical_user_ids() -> None:
+    """Verify that the real challenge corpus produces 0 non-canonical user IDs and 0 parser errors."""
+    import re
+
+    dataset_dir = Path("dataset")
+    corpus = EvidenceCorpus(
+        evidence_dir=dataset_dir / "evidence",
+        manifest_path=dataset_dir / "evidence_files.csv",
+        activity_path=dataset_dir / "system_activity.csv",
+        audit_path=dataset_dir / "user_audit_log.csv",
+    )
+    index = corpus.build_index()
+
+    # Exact expected item count (expanded from 7607 to 8365 with nested JSON snapshots and service exports)
+    assert len(index._all_items) == 8365
+    # Exactly zero parsing errors across the complete manifest
+    assert len(index.parsing_errors) == 0
+
+    # Every item must have either user_id is None or match ^user_\d+$
+    canonical_pattern = re.compile(r"^user_\d+$")
+    for item in index._all_items:
+        if item.user_id is not None:
+            assert canonical_pattern.match(item.user_id) is not None, (
+                f"Non-canonical user_id '{item.user_id}' in evidence_id '{item.evidence_id}'"
+            )
+
+
+# -----------------------------------------------------------------------------
+# Sprint 3C Tests: Nested JSON Ingestion and Log Trace Correlation
+# -----------------------------------------------------------------------------
+
+def test_parse_json_bundle_nested_service_exports(tmp_path: Path) -> None:
+    """Verify that nested service_exports JSON files are ingested with correct categories and statuses."""
+    payload = {
+        "exported_at": "2026-09-15T11:44:55Z",
+        "service_exports": {
+            "account_service": {
+                "profile_lookups": [
+                    {"observed_at": "2026-09-15T09:31:40Z", "profile": None, "resource_id": "account_3136", "status_code": 404},
+                    {"observed_at": "2026-09-15T09:41:33Z", "profile": {"email": "test@example.com", "customer_reference": "user_24"}, "resource_id": "account_5334", "status_code": 200},
+                ]
+            },
+            "backup_service": {
+                "restore_entries": [
+                    {"observed_at": "2026-09-15T10:58:35Z", "resource_id": "backup_3120", "customer_reference": "user_26", "restore_allowed": False}
+                ]
+            },
+            "integration_service": {
+                "connectors": [
+                    {"observed_at": "2026-09-15T08:48:09Z", "resource_id": "data_flow_2295", "customer_reference": "user_27", "enabled": False, "last_delivery_status": "stopped"}
+                ]
+            },
+        }
+    }
+    json_path = tmp_path / "service_export.json"
+    json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    errors: List[ParserError] = []
+    items = parse_json_bundle(json_path, "evidence_92_test", "2026-09-15T12:00:00Z", "service_export", error_sink=errors)
+    assert len(errors) == 0
+    assert len(items) == 4
+
+    by_res = {i.resource_id: i for i in items}
+    assert by_res["account_3136"].status == "ABSENT"
+    assert by_res["account_3136"].system_id == "account_service"
+
+    assert by_res["account_5334"].status == "PRESENT"
+    assert by_res["account_5334"].user_id == "user_24"
+    assert by_res["account_5334"].raw_payload.get("email") == "test@example.com"
+
+    assert by_res["backup_3120"].status == "BLOCKED"
+    assert by_res["backup_3120"].user_id == "user_26"
+
+    assert by_res["data_flow_2295"].status == "DISABLED"
+    assert by_res["data_flow_2295"].user_id == "user_27"
+
+
+def test_parse_json_bundle_nested_snapshots(tmp_path: Path) -> None:
+    """Verify that snapshot bundle JSON files are ingested across collections."""
+    payload = {
+        "exported_at": "2026-09-15T12:00:00Z",
+        "snapshots": [
+            {
+                "data_store": "account_service",
+                "collection": "customer_profiles",
+                "records": [
+                    {"resource_id": "account_4857", "customer_reference": "user_541", "email": "user541@example.com", "account_status": "ACTIVE"}
+                ]
+            },
+            {
+                "data_store": "identity_service",
+                "collection": "deleted_customer_references",
+                "records": [
+                    {"resource_id": "tombstone_440", "subject_reference": "user_541", "account_status": "DELETED"}
+                ]
+            }
+        ]
+    }
+    json_path = tmp_path / "snapshot_bundle.json"
+    json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    items = parse_json_bundle(json_path, "evidence_51_test", "2026-09-15T12:00:00Z", "snapshots")
+    assert len(items) == 2
+
+    by_res = {i.resource_id: i for i in items}
+    assert by_res["account_4857"].user_id == "user_541"
+    assert by_res["account_4857"].system_id == "account_service"
+    assert by_res["account_4857"].status == "ACTIVE"
+
+    assert by_res["tombstone_440"].user_id == "user_541"
+    assert by_res["tombstone_440"].status == "REDACTED"
+
+
+def test_parse_log_file_trace_correlation_and_hash(tmp_path: Path) -> None:
+    """Verify log trace correlation for 404 lookups and 64-char correlation_key indexing."""
+    lines = [
+        "2026-09-26T08:57:37Z level=DEBUG service=account_service trace_id=tr-01 event=profile_lookup_started resource_id=account_7566 lookup_key=user@example.com",
+        "2026-09-26T08:57:37Z level=INFO service=account_service trace_id=tr-01 event=profile_lookup_completed resource_id=account_7566 rows=0 http_status=404",
+        '2026-09-15T11:58:26Z level=DEBUG service=analytics_platform resource_id=analytics_9914 correlation_key="44a65154bfd8e408852578fbd76813d094d1944f255ac1769ee81ba90492f10e" event=contact_lookup_completed rows=1',
+    ]
+    log_path = tmp_path / "test.log"
+    log_path.write_text("\n".join(lines), encoding="utf-8")
+
+    items = parse_log_file(log_path, "log_ev_test", "2026-09-26T12:00:00Z", "log")
+    assert len(items) == 3
+
+    by_res = {i.resource_id: i for i in items if i.action == "profile_lookup_completed"}
+    assert by_res["account_7566"].status == "ABSENT"
+    assert by_res["account_7566"].raw_payload.get("email") == "user@example.com"
+
+    analytics_item = [i for i in items if i.resource_id == "analytics_9914"][0]
+    assert analytics_item.raw_payload.get("email_hash") == "44a65154bfd8e408852578fbd76813d094d1944f255ac1769ee81ba90492f10e"
