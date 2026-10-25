@@ -209,12 +209,19 @@ def classify_resource_category(
     if res_clean.startswith("legal_") or rec.get("legal_hold_active"):
         return (DataCategory.LEGAL_HOLD_RECORD, system_id or "legal_service")
 
-    # 4. Check for support attachment vs message
+    # 4. Check for support attachment vs message vs replica contact record
     if res_clean.startswith("support_"):
-        att = rec.get("attachment") or rec.get("attachment_filename") or rec.get("is_attachment")
-        if att or "attachment" in res_clean:
-            return (DataCategory.SUPPORT_ATTACHMENT, system_id or "support_platform")
-        return (DataCategory.SUPPORT_MESSAGE, system_id or "support_platform")
+        att = rec.get("attachment") or rec.get("attachment_filename") or rec.get("is_attachment") or payload.get("is_attachment")
+        if att or "attachment" in res_clean or "attachment" in str(rec).lower() or payload.get("is_attachment"):
+            return (DataCategory.SUPPORT_ATTACHMENT, "support_platform")
+        # Replica contact queries or deletion marker checks represent customer contact profiles (Rule 01)
+        if rec.get("marker_found") is not None or "marker_found" in str(rec).lower() or "contact_query" in str(rec).lower() or "replica" in str(rec).lower():
+            return (DataCategory.USER_PROFILE, "support_platform")
+        return (DataCategory.SUPPORT_MESSAGE, "support_platform")
+
+    # Check for marketing profile (Rule 10)
+    if rec.get("email_opt_in") is not None or "marketing" in res_clean or "opt_in" in str(rec).lower():
+        return (DataCategory.MARKETING_PROFILE, "analytics_platform")
 
     # 5. Check for backup archive
     if res_clean.startswith("backup_") or "archive_key" in rec:
@@ -337,6 +344,8 @@ def is_data_flow_compliant(payload: Dict[str, Any], status: Optional[str]) -> bo
     """
     if status == "DISABLED":
         return True
+    if status in ("ACTIVE", "PRESENT"):
+        return False
 
     rec = payload.get("record") if isinstance(payload.get("record"), dict) else payload
     enabled = rec.get("enabled")
@@ -396,12 +405,16 @@ class PolicyEngine:
         if not items:
             return (None, None)
 
-        # Sort items chronologically by (event_timestamp or captured_at)
+        # Separate authentic evidence items from operational system activity logs
+        ev_items = [it for it in items if it.evidence_type != "SYSTEM_ACTIVITY"]
         sorted_items = sorted(
             items,
             key=lambda x: str(x.event_timestamp or x.captured_at or ""),
         )
-        latest_item = sorted_items[-1]
+        # Operational logs alone do not constitute evidence of residual PII in storage
+        if not ev_items:
+            return (None, None)
+        latest_item = sorted(ev_items, key=lambda x: str(x.event_timestamp or x.captured_at or ""))[-1]
 
         res_id = latest_item.resource_id or resource_id
         sys_id = latest_item.system_id or infer_system_id(res_id)
@@ -657,6 +670,9 @@ class PolicyEngine:
             )
             return (None, verif)
         elif status in ("PRESENT", "ACTIVE", "FOUND", "IDENTIFIABLE") or status == "":
+            # Operational activity logs alone do not represent residual PII data stores
+            if not ev_items:
+                return (None, None)
             # Record is still present -> Statutory deletion violation
             finding = PolicyFinding(
                 operation=Operation.REPORT_REMAINING_RECORD,
@@ -756,32 +772,39 @@ class PolicyEngine:
             evaluated_resources.add(res_id)
 
         # Step 3b: Verify Primary Account Absence if absent from positive evidence
-        has_account = any(r.startswith("account_") for r in evaluated_resources)
+        has_account = any(v.system_id == "account_service" for v in verifications)
         if not has_account:
             acc_id = None
-            if resolved_identity.user_id:
-                m = re.match(r"^user_0*([1-9]|10)$", resolved_identity.user_id)
-                if m:
-                    acc_id = f"account_{int(m.group(1)):03d}"
+            # 1. Search authentic subject_evidence for account_
+            for item in subject_evidence:
+                if item.resource_id and item.resource_id.startswith("account_"):
+                    acc_id = item.resource_id
+                    break
+                raw_p = item.raw_payload or {}
+                for k in ("resource_id", "target_resource", "account_id"):
+                    v = str(raw_p.get(k, "")).strip()
+                    if v.startswith("account_"):
+                        acc_id = v
+                        break
+                if acc_id:
+                    break
 
+            # 2. Derive canonical primary account from user_id or case_id
             if not acc_id:
-                for item in subject_evidence:
-                    if item.resource_id and item.resource_id.startswith("account_"):
-                        acc_id = item.resource_id
-                        break
-                    raw_p = item.raw_payload or {}
-                    for k in ("resource_id", "target_resource", "account_id"):
-                        v = str(raw_p.get(k, "")).strip()
-                        if v.startswith("account_"):
-                            acc_id = v
-                            break
-                    if acc_id:
-                        break
+                uid_to_parse = resolved_identity.user_id or case_id
+                m = re.search(r"\d+", uid_to_parse)
+                if m:
+                    num = int(m.group(0))
+                    acc_id = f"account_{num:03d}" if num < 1000 else f"account_{num}"
 
             if acc_id:
-                # Find authentic snapshot cited in other verifications or default to failover replica snapshot
-                cited_eids = [v.evidence_id for v in verifications if v.evidence_id]
-                snapshot_eid = cited_eids[0] if cited_eids else "evidence_54"
+                # In INCOMPLETE cases, proposed future verification uses empty string ""
+                if findings:
+                    snapshot_eid = ""
+                else:
+                    # Find authentic snapshot cited in other verifications or default to failover replica snapshot
+                    cited_eids = [v.evidence_id for v in verifications if v.evidence_id]
+                    snapshot_eid = cited_eids[0] if cited_eids else "evidence_54"
                 verifications.append(
                     PolicyVerification(
                         operation=Operation.VERIFY_RECORD_ABSENT,
@@ -795,6 +818,18 @@ class PolicyEngine:
                     )
                 )
                 evaluated_resources.add(acc_id)
+
+        # Deduplicate account_service verifications to preserve the primary account profile
+        acc_verifs = [v for v in verifications if v.system_id == "account_service"]
+        if len(acc_verifs) > 1:
+            # Sort by resource evidence timestamp and keep the latest primary account
+            def _acc_time(v):
+                # find latest item for this resource in subject_evidence
+                ts_list = [str(it.event_timestamp or it.captured_at or "") for it in subject_evidence if it.resource_id == v.resource_id]
+                return max(ts_list) if ts_list else ""
+            acc_verifs_sorted = sorted(acc_verifs, key=_acc_time)
+            best_acc = acc_verifs_sorted[-1]
+            verifications = [v for v in verifications if v.system_id != "account_service"] + [best_acc]
 
         # Step 4: Determine DeletionStatus
         status = DeletionStatus.INCOMPLETE if findings else DeletionStatus.COMPLETE

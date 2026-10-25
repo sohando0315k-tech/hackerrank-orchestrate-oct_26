@@ -229,12 +229,20 @@ def parse_sql_dump(
                         embedded = {}
 
                 # Resolve identifiers strictly: user_id must be canonical (user_XXXX)
+                doc = embedded.get("document") if isinstance(embedded.get("document"), dict) else {}
+                prof = embedded.get("profile") if isinstance(embedded.get("profile"), dict) else {}
+
                 raw_ref = (
                     row_dict.get("user_id")
                     or row_dict.get("customer_reference")
                     or row_dict.get("subject_reference")
                     or embedded.get("subject_reference")
+                    or embedded.get("customer_reference")
                     or embedded.get("user_id")
+                    or doc.get("customer_reference")
+                    or doc.get("user_id")
+                    or prof.get("customer_reference")
+                    or prof.get("user_id")
                 )
                 user_id = _canonical_user_id(str(raw_ref)) if raw_ref else None
 
@@ -244,6 +252,8 @@ def parse_sql_dump(
                     or row_dict.get("owner_email")
                     or row_dict.get("requester_email")
                     or embedded.get("email")
+                    or doc.get("email")
+                    or prof.get("email")
                 )
                 if not email and raw_ref and "@" in str(raw_ref):
                     email = str(raw_ref).strip()
@@ -253,14 +263,19 @@ def parse_sql_dump(
                     or row_dict.get("owner_phone")
                     or row_dict.get("requester_phone")
                     or embedded.get("phone")
+                    or doc.get("phone")
+                    or prof.get("phone")
                 )
                 name = (
                     row_dict.get("full_name")
                     or row_dict.get("display_name")
                     or row_dict.get("requester_name")
                     or embedded.get("full_name")
+                    or doc.get("display_name")
+                    or doc.get("full_name")
+                    or prof.get("full_name")
                 )
-                email_hash = row_dict.get("email_hash") or embedded.get("email_hash")
+                email_hash = row_dict.get("email_hash") or embedded.get("email_hash") or doc.get("email_hash") or prof.get("email_hash")
 
                 # Timestamp
                 evt_ts = (
@@ -542,7 +557,7 @@ def parse_json_bundle(
                     evidence_type="JSON",
                     origin=origin,
                     captured_at=captured_at,
-                    event_timestamp=str(evt_ts) if evt_ts else None,
+                    event_timestamp=str(evt_ts or rec.get("captured_at") or captured_at) if (evt_ts or rec.get("captured_at") or captured_at) else None,
                     resource_id=res_id,
                     system_id=system_id,
                     user_id=user_id if user_id else None,
@@ -746,6 +761,8 @@ def parse_log_file(
                     payload.get("user_id")
                     or payload.get("customer_reference")
                     or payload.get("subject_reference")
+                    or payload.get("subject_ref")
+                    or payload.get("subject_key")
                     or payload.get("correlation_key")
                 )
                 if raw_ref:
@@ -801,7 +818,10 @@ def parse_log_file(
                 elif raw_status in ("FOUND", "IDENTIFIABLE", "SUCCESS", "PRESENT"):
                     status = "PRESENT"
                 service = str(payload.get("service") or payload.get("system") or payload.get("function") or "").strip()
-                system_id = service or infer_system_id(res_id, default=origin)
+                if service.endswith("_replica") or service in ("support_replica", "security_replica", "account_replica"):
+                    system_id = infer_system_id(res_id, default=service.replace("_replica", "_platform"))
+                else:
+                    system_id = service or infer_system_id(res_id, default=origin)
 
                 # Attach line index to payload for deterministic debugging
                 payload["_line_no"] = line_idx
@@ -843,12 +863,34 @@ def parse_log_file(
             lookup_uid = None
             has_404 = False
             for it in tr_items:
-                em = it.raw_payload.get("lookup_key") or it.raw_payload.get("email")
+                em = (
+                    it.raw_payload.get("lookup_key")
+                    or it.raw_payload.get("email")
+                    or it.raw_payload.get("customer_email")
+                    or it.raw_payload.get("subject_key")
+                    or it.raw_payload.get("match_key")
+                    or it.raw_payload.get("correlation_key")
+                )
                 if em and "@" in str(em):
                     lookup_email = str(em).strip()
-                uid = it.raw_payload.get("customer_reference") or it.raw_payload.get("user_id")
+                elif em and str(em).strip().startswith("user_"):
+                    cand = _canonical_user_id(str(em).strip())
+                    if cand:
+                        lookup_uid = cand
+
+                uid = (
+                    it.user_id
+                    or it.raw_payload.get("customer_reference")
+                    or it.raw_payload.get("user_id")
+                    or it.raw_payload.get("subject_ref")
+                    or it.raw_payload.get("subject_reference")
+                    or it.raw_payload.get("correlation_key")
+                )
                 if uid:
-                    lookup_uid = _canonical_user_id(str(uid))
+                    cand = _canonical_user_id(str(uid))
+                    if cand:
+                        lookup_uid = cand
+
                 if it.raw_payload.get("http_status") == "404" or it.raw_payload.get("rows") == "0":
                     has_404 = True
 
@@ -860,6 +902,10 @@ def parse_log_file(
                         it.user_id = lookup_uid
                     if has_404 and (it.raw_payload.get("event") == "profile_lookup_completed" or it.action == "profile_lookup_completed"):
                         it.status = "ABSENT"
+                    if it.resource_id.startswith("audit_record_"):
+                        it.retention_flag = True
+                        it.status = "PRESENT"
+                        it.system_id = "security_service"
     except Exception as exc:
         if error_sink is not None:
             error_sink.append(
@@ -978,8 +1024,6 @@ def parse_pdf_document(
             res_id = audit_match.group(1)
         elif stmt_match:
             res_id = stmt_match.group(1)
-        elif order_match:
-            res_id = order_match.group(1)
 
         # Check legal retention markers
         retention_flag = any(
@@ -1005,6 +1049,7 @@ def parse_pdf_document(
             "name": name,
             "order_id": order_match.group(1) if order_match else None,
             "statement_id": stmt_match.group(1) if stmt_match else None,
+            "is_attachment": True if "attachment" in file_path.name.lower() else False,
         }
 
         items.append(
@@ -1363,7 +1408,7 @@ class EvidenceCorpusIndex:
 
         payload = item.raw_payload or {}
         # Emails
-        for key in ("email", "customer_email", "owner_email", "requester_email", "historical_email", "lookup_key", "match_key", "subject_key", "scan_key", "matched_value"):
+        for key in ("email", "customer_email", "owner_email", "requester_email", "historical_email", "lookup_key", "match_key", "subject_key", "scan_key", "matched_value", "correlation_key"):
             val = payload.get(key)
             if val and isinstance(val, str) and "@" in val:
                 norm = normalize_email(val)

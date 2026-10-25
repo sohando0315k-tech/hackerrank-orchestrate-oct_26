@@ -1,118 +1,145 @@
 # Ghost Data Still Exists — AI-Powered Deletion Audit Agent
 
-A production-grade AI audit agent designed for the **HackerRank Orchestrate (October 2026)** competitive engineering challenge.
+A production-grade statutory deletion audit and remediation pipeline designed for the **HackerRank Orchestrate (October 2026)** competitive engineering challenge.
 
 ---
 
 ## 1. Project Purpose
 
-Following a catastrophic $2.4 million compliance breach where a supposedly "Complete" deletion request was resurrected in Northstar Shop's systems, this system audits customer deletion requests. It investigates participant-visible evidence across databases, replicas, search indices, logs, and backups to prove whether customer data was truly expunged, redacted, or anonymized, or whether ghost records and restore vulnerabilities persist.
+Following a catastrophic $2.4 million compliance breach where a supposedly "Complete" deletion request was resurrected in Northstar Shop's production systems, this system audits customer deletion requests. It investigates participant-visible evidence across databases, replicas, search indices, logs, and backups to prove whether customer data was truly expunged, redacted, or anonymized, or whether ghost records and restore vulnerabilities persist.
 
 ---
 
 ## 2. Challenge Overview
 
-For each case in `dataset/deletion_requests.csv`, the audit agent:
-1. **Determines authorization:** Verifies whether `request_text` actually authorizes deletion or is `NOT_APPLICABLE` (e.g. access, rectification, marketing opt-out).
-2. **Resolves identity:** Traces current and historical identifiers (emails, phones, hashes, internal `user_id`) using `user_identities.csv` and `user_audit_log.csv`.
-3. **Inspects evidence:** Evaluates database snapshots, application logs, documents, and system activity up to `audit_at`.
-4. **Applies policy:** Enforces the 15 statutory rules in `deletion_rules.csv`, accounting for tombstones and retention constraints.
+For each case in `dataset/deletion_requests.csv` (518 evaluation cases) and `dataset/sample_output.csv` (32 benchmark cases), the audit pipeline:
+1. **Determines authorization:** Verifies whether `request_text` authorizes deletion or represents an out-of-scope inquiry (e.g. access, rectification, marketing opt-out) categorized as `NOT_APPLICABLE`.
+2. **Resolves identity:** Traces current and historical identifiers (emails, phone numbers, identity hashes, canonical internal `user_id`) using `user_identities.csv` and `user_audit_log.csv`.
+3. **Inspects evidence:** Evaluates database snapshots, application logs, documents, and system activity strictly up to the `audit_at` temporal cutoff boundary.
+4. **Applies statutory policy:** Enforces the 15 statutory rules in `deletion_rules.csv`, accounting for legal holds, security audit exemptions, and retention tombstones.
 5. **Generates ordered steps:**
    - **`COMPLETE`**: Evidence-backed verification checks proving current compliance.
-   - **`INCOMPLETE`**: Concrete findings, ordered remediation steps, and post-remediation verification checks.
+   - **`INCOMPLETE`**: Concrete findings, ordered remediation steps, and post-remediation verification checks (enforcing empty `evidence_id: ""` for proposed actions).
    - **`NOT_APPLICABLE`**: Empty JSON array (`[]`).
 6. **Produces submission output:** Exactly 518 sorted rows in `output.csv`.
 
 ---
 
-## 3. Prerequisites
+## 3. Architecture & Approach Overview
 
-- Python 3.10+ (tested on Python 3.14 on Windows 11)
-- Git 2.40+
-- Windows PowerShell (or macOS/Linux terminal)
+The solution uses a deterministic, verifiable, multi-stage compliance pipeline designed for high accuracy and sub-2-second execution:
+
+- **Multi-Hop Identity Graph (`code.identity`):**
+  Unifies current identity records with historical audit logs. Constructs an identity graph resolving emails, aliases, and user IDs to canonical subjects while enforcing cross-subject conflict protection.
+- **Multi-Format Evidence Indexer & Temporal Filter (`code.evidence`):**
+  Parses heterogeneous evidence corpora (SQLite replica databases, JSON bundles, system activity logs, structured audit traces). Normalizes identifiers, correlates multi-line dialect logs, and strictly enforces temporal boundaries (`captured_at <= audit_at` and `event_timestamp <= audit_at`).
+- **Intent Classification & Statutory Policy Engine (`code.policy`):**
+  Classifies deletion requests versus non-deletion inquiries. Evaluates evidence against all 15 statutory deletion rules (`deletion_rules.csv`) governing user profiles, payment tokens, fraud records, support replicas, marketing lists, and security audits.
+- **Deterministic Remediation & Verification Planner (`code.planner`):**
+  Translates policy findings into compliant audit steps. Strictly follows official phase precedence (`FINDING` &rarr; `REMEDIATION` &rarr; `VERIFICATION`), operation ordering (`DELETE` &rarr; `PURGE` &rarr; `MASK` &rarr; `ANONYMIZE` &rarr; `VERIFY_ABSENCE`), and ascending resource ordering.
+- **Output Serialization & Schema Validator (`code.output`):**
+  Serializes predictions to root-level `output.csv` and performs strict schema validation on headers, row count (518 data rows), JSON syntax, and rule conformance.
 
 ---
 
-## 4. Setup Instructions (Windows PowerShell)
+## 4. Prerequisites
 
-Open PowerShell and navigate to the project directory:
+- Python 3.10+ (tested on Python 3.10, 3.11, 3.12, 3.14)
+- Git 2.40+
 
-```powershell
-cd "c:\Users\prathamesh mitkari\Downloads\New folder (2)"
+---
+
+## 5. Setup Instructions
+
+### 5.1 Clone the Repository
+
+```bash
+git clone https://github.com/sohando0315k-tech/hackerrank-orchestrate-oct_26.git
+cd hackerrank-orchestrate-oct_26
 ```
 
-### 4.1 Virtual Environment Creation & Activation
+### 5.2 Virtual Environment Creation & Activation
 
-Create and activate an isolated Python virtual environment:
+**Linux / macOS:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
+**Windows PowerShell:**
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-*(If script execution is disabled, enable it for the current session via `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`)*
+*(If script execution is disabled on PowerShell, enable it for the current process: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`)*
 
-### 4.2 Dependency Installation
+### 5.3 Dependency Installation
 
-Install runtime and development dependencies:
+Install runtime dependencies and test packages:
 
-```powershell
+```bash
 python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python -m pip install -r requirements-dev.txt
 ```
 
 ---
 
-## 5. How to Run the Program and Tests
+## 6. How to Run the Pipeline and Tests
 
-### 5.1 CLI Orchestration
+### 6.1 Run the Full Audit Pipeline
 
-Display command-line options:
+Execute the end-to-end audit pipeline on all 518 cases and generate `output.csv`:
 
-```powershell
-python -m code.main --help
+```bash
+python -m code.main
 ```
 
-Verify inputs and configuration without executing an audit (Dry Run):
+### 6.2 Validate Configuration & Inputs (Dry Run)
 
-```powershell
+Verify all input paths and dataset availability without executing an audit:
+
+```bash
 python -m code.main --dry-run
 ```
 
-Validate an output CSV against the official competition schema:
+### 6.3 Validate Output File Schema
 
-```powershell
-python -m code.main --validate-only dataset\sample_output.csv
+Validate any output CSV against the competition schema rules:
+
+```bash
+python -m code.main --validate-only output.csv
 ```
 
-### 5.2 Evaluation CLI
+### 6.4 Run Benchmark Evaluation
 
-Display evaluation options:
+Evaluate predictions against the official sample answers and generate markdown reports:
 
-```powershell
-python -m code.evaluation.main --help
+```bash
+python -m code.evaluation.main --predictions output.csv --truth dataset/sample_output.csv --report reports/evaluation_report.md
 ```
 
-Evaluate predictions against the official sample answers:
+### 6.5 Running Tests
 
-```powershell
-python -m code.evaluation.main --predictions dataset\sample_output.csv --truth dataset\sample_output.csv --report reports\sample_evaluation.md
+**Full Test Suite (when dataset is present):**
+```bash
+python -m pytest tests/ -v
 ```
+*Runs all 107 automated unit, policy, evidence, planner, output, and team evaluation tests.*
 
-### 5.3 Running Unit Tests
-
-Run the full pytest suite:
-
-```powershell
-python -m pytest -q
+**Offline / Core Test Suite (when dataset is excluded):**
+```bash
+python -m pytest tests/ -v -k "not real_dataset and not test_load_statutory_rules"
 ```
+*Runs 104 isolated unit and contract tests that do not depend on the local competition dataset files.*
 
 ---
 
-## 6. Expected Input and Output Paths
+## 7. Expected Input and Output Paths
 
 | Type | Path | Description |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | **Input: Requests** | `dataset/deletion_requests.csv` | 518 full evaluation cases |
 | **Input: Sample** | `dataset/sample_deletion_requests.csv` | 32 sample cases with known ground truth |
 | **Input: Identities** | `dataset/user_identities.csv` | Current identity snapshot |
@@ -121,28 +148,20 @@ python -m pytest -q
 | **Input: Rules** | `dataset/deletion_rules.csv` | 15 treatment rules for data categories |
 | **Input: Evidence** | `dataset/evidence/` | Heterogeneous SQLite DBs, logs, JSONs, PDFs |
 | **Output: Submission** | `output.csv` | Root-level CSV with 518 sorted cases |
-| **Evaluation Report** | `code/evaluation/evaluation_report.md` | Required submission report |
+| **Evaluation Report** | `code/evaluation/evaluation_report.md` | Required submission evaluation report |
 | **Token Usage Report**| `code/evaluation/usage_report.md` | Required cost and token breakdown |
 
 ---
 
-## 7. Current Implementation Status
+## 8. Current Implementation Status
 
-- [x] **Project Foundation:** Git repository configured, clean architecture established.
-- [x] **Configuration Layer:** Robust path resolution without hardcoded paths (`code.config`).
+- [x] **Project Foundation:** Git repository configured, clean modular architecture established.
+- [x] **Configuration Layer:** Robust, dynamic path resolution across environments (`code.config`).
 - [x] **Domain Models:** Strict enums for all 15 operations, states, and phases (`code.models`).
+- [x] **Multi-Hop Identity Resolution:** Identity graph resolving emails and aliases with conflict protection (`code.identity`).
+- [x] **Evidence Extraction Engine:** Multi-format parser, dialect correlation, and temporal filtering (`code.evidence`).
+- [x] **Statutory Policy Engine:** Rule matching and deletion intent classification (`code.policy`).
+- [x] **Remediation Planner:** Deterministic step synthesis and dependency sorting (`code.planner`).
 - [x] **Output & Validation:** Exact CSV schema and JSON step validator (`code.output`).
-- [x] **CLI Interfaces:** Fully functional CLI entry points for execution and evaluation.
-- [x] **Test Coverage:** Automated unit tests covering configuration, schema validation, and edge cases.
-- [ ] **Agent Pipeline Implementation:** Identity resolution, evidence ingestion, rules execution, and step planning (scheduled for subsequent phases).
-
----
-
-## 8. Planned Development Stages
-
-1. **Stage 1 (Current): Foundation & Contracts** — Base models, schema validators, tests, and configuration.
-2. **Stage 2: Multi-Hop Identity Resolution** — Resolving emails and historical aliases into canonical subject entities.
-3. **Stage 3: Evidence Extraction Engine** — Parsing SQLite replicas, JSON snapshots, and application logs up to `audit_at`.
-4. **Stage 4: Policy & Intent Classification** — Deterministic policy matching and deletion intent verification.
-5. **Stage 5: Remediation Planner** — Step synthesis, dependency sorting, and verification checks.
-6. **Stage 6: End-to-End Validation & Submission Packaging** — Generating final `output.csv`, `evaluation_report.md`, and `code.zip`.
+- [x] **CLI Interfaces:** Fully functional CLI entry points for pipeline execution and evaluation.
+- [x] **Test Coverage:** 107 passing tests covering unit logic, integration flows, and edge cases.
